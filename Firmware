@@ -1,1 +1,428 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_MPU6050.h>
+#include <DHT.h>
 
+// ============================================================================
+// BEGINNER SETTINGS
+// ============================================================================
+
+// 1. Hardware Pin Definitions (XIAO ESP32-C3)
+const int I2C_SDA_PIN    = 6;  // D4 / GPIO6
+const int I2C_SCL_PIN    = 7;  // D5 / GPIO7
+const int DHT_PIN        = 3;  // D1 / GPIO3
+const int BUTTON_ONE_PIN = 4;  // D2 / GPIO4
+const int BUTTON_TWO_PIN = 5;  // D3 / GPIO5
+
+const bool USE_DHT11 = true;
+#define DHTTYPE DHT11
+
+// OLED Screen Configuration
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C
+
+// Sprite Settings (32x32 pixel pet sprite)
+const int PET_SPRITE_WIDTH  = 32;
+const int PET_SPRITE_HEIGHT = 32;
+
+// Starter Pet Sprite Bitmap (32x32 pixels, 1-bit vertical byte alignment)
+const uint8_t PROGMEM PET_SPRITE[] = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x03, 0x80, 0x01, 0xc0, 0x07, 0xc0, 0x03, 0xe0,
+  0x0f, 0xe0, 0x07, 0xf0, 0x0f, 0xf0, 0x0f, 0xf0,
+  0x1f, 0xf8, 0x1f, 0xf8, 0x1f, 0xff, 0xff, 0xf8,
+  0x3f, 0xff, 0xff, 0xfc, 0x3f, 0xff, 0xff, 0xfc,
+  0x7f, 0xff, 0xff, 0xfe, 0x7f, 0x0f, 0xf0, 0xfe,
+  0x7e, 0x07, 0xe0, 0x7e, 0x7c, 0x03, 0xc0, 0x3e,
+  0x7c, 0x13, 0xc8, 0x3e, 0x7e, 0x1b, 0xd8, 0x7e,
+  0x7f, 0x0f, 0xf0, 0xfe, 0x3f, 0xff, 0xff, 0xfc,
+  0x3f, 0x80, 0x01, 0xfc, 0x1f, 0xc0, 0x03, 0xf8,
+  0x1f, 0xe1, 0x87, 0xf8, 0x0f, 0xff, 0xff, 0xf0,
+  0x07, 0xff, 0xff, 0xe0, 0x03, 0xff, 0xff, 0xc0,
+  0x01, 0xff, 0xff, 0x80, 0x00, 0x7f, 0xfe, 0x00,
+  0x00, 0x1f, 0xf8, 0x00, 0x00, 0x07, 0xe0, 0x00,
+  0x00, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+// Reaction Types
+enum ReactionType {
+  NAP_REACTION,
+  RUN_REACTION,
+  JUMP_REACTION,
+  HEART_REACTION
+};
+
+// 2. Radial Menu Configuration
+struct MenuItem {
+  const char* label;
+  int joyDelta;
+  int energyDelta;
+  int fullnessDelta;
+  ReactionType reaction;
+};
+
+const MenuItem MENU_ITEMS[] = {
+  {"NAP",   1,  18, -4, NAP_REACTION},   // Top
+  {"PLAY", 12, -9, -5, RUN_REACTION},    // Right
+  {"FEED",  3,  2, 18, JUMP_REACTION},   // Bottom
+  {"PET",   7,  0,  0, HEART_REACTION},  // Left
+};
+
+// ============================================================================
+// SYSTEM HARDWARE & STATE GLOBALS
+// ============================================================================
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_MPU6050 mpu;
+DHT dht(DHT_PIN, DHTTYPE);
+
+// Pet Stats
+int joy = 70;
+int energy = 80;
+int fullness = 60;
+
+// Pet Position & Movement
+int petX = 48;
+int petY = 28;
+int petDirX = 1;
+unsigned long lastWalkTime = 0;
+
+// Interface State
+bool isMenuOpen = false;
+int selectedSector = 0; // 0=Top, 1=Right, 2=Bottom, 3=Left
+bool showStats = false;
+
+// Mode State
+enum AppMode { MODE_NORMAL, MODE_NAPPING, MODE_RUNNING, MODE_JUMPING, MODE_HEARTS };
+AppMode currentMode = MODE_NORMAL;
+unsigned long modeStartTime = 0;
+
+// Floating Particles
+struct Particle { int x, y; bool active; };
+Particle hearts[5];
+Particle zzzs[3];
+
+// Debounce Tracking
+bool prevBtn1 = HIGH;
+bool prevBtn2 = HIGH;
+unsigned long lastBtn1Press = 0;
+unsigned long lastBtn2Press = 0;
+
+// ============================================================================
+// SPECIAL EFFECTS & DRAWING HELPERS
+// ============================================================================
+
+// 3. Custom Sparkle Particle Effect
+void drawSparkle(int x, int y) {
+  display.drawPixel(x, y - 2, SSD1306_WHITE);
+  display.drawPixel(x - 1, y - 1, SSD1306_WHITE);
+  display.drawPixel(x + 1, y - 1, SSD1306_WHITE);
+  display.drawPixel(x - 2, y, SSD1306_WHITE);
+  display.drawPixel(x, y, SSD1306_WHITE);
+  display.drawPixel(x + 2, y, SSD1306_WHITE);
+  display.drawPixel(x - 1, y + 1, SSD1306_WHITE);
+  display.drawPixel(x + 1, y + 1, SSD1306_WHITE);
+  display.drawPixel(x, y + 2, SSD1306_WHITE);
+}
+
+bool isNapping() {
+  return currentMode == MODE_NAPPING;
+}
+
+void drawHeartIcon(int x, int y) {
+  display.drawPixel(x + 1, y, SSD1306_WHITE);
+  display.drawPixel(x + 3, y, SSD1306_WHITE);
+  display.fillRect(x, y + 1, 5, 2, SSD1306_WHITE);
+  display.drawPixel(x + 1, y + 3, SSD1306_WHITE);
+  display.drawPixel(x + 3, y + 3, SSD1306_WHITE);
+  display.drawPixel(x + 2, y + 4, SSD1306_WHITE);
+}
+
+void drawPet(int x, int y) {
+  display.drawBitmap(x, y, PET_SPRITE, PET_SPRITE_WIDTH, PET_SPRITE_HEIGHT, SSD1306_WHITE);
+
+  // Render Sparkle Trail behind pet
+  unsigned long now = millis();
+  if (!isNapping() && (now / 250) % 2 == 0) {
+    drawSparkle(x - 4, y + 18);
+  }
+}
+
+// ============================================================================
+// GAME LOGIC & ANIMATIONS
+// ============================================================================
+
+void applyMenuChoice(int sector) {
+  const MenuItem& item = MENU_ITEMS[sector];
+  joy = constrain(joy + item.joyDelta, 0, 100);
+  energy = constrain(energy + item.energyDelta, 0, 100);
+  fullness = constrain(fullness + item.fullnessDelta, 0, 100);
+
+  modeStartTime = millis();
+  switch (item.reaction) {
+    case NAP_REACTION:
+      currentMode = MODE_NAPPING;
+      for (int i = 0; i < 3; i++) zzzs[i].active = false;
+      break;
+    case RUN_REACTION:
+      currentMode = MODE_RUNNING;
+      break;
+    case JUMP_REACTION:
+      currentMode = MODE_JUMPING;
+      break;
+    case HEART_REACTION:
+      currentMode = MODE_HEARTS;
+      for (int i = 0; i < 5; i++) {
+        hearts[i].x = petX + 8 + random(-8, 8);
+        hearts[i].y = petY - random(0, 6);
+        hearts[i].active = true;
+      }
+      break;
+  }
+}
+
+void updateAnimations() {
+  unsigned long now = millis();
+  unsigned long elapsed = now - modeStartTime;
+
+  if (currentMode == MODE_NAPPING) {
+    if (elapsed > 10000) {
+      currentMode = MODE_NORMAL;
+    } else {
+      for (int i = 0; i < 3; i++) {
+        if (!zzzs[i].active && random(0, 10) < 2) {
+          zzzs[i].x = petX + 22 + random(-2, 4);
+          zzzs[i].y = petY + 4;
+          zzzs[i].active = true;
+          break;
+        }
+      }
+    }
+  } else if (currentMode == MODE_RUNNING) {
+    if (elapsed < 500) {
+      petX += 3;
+    } else if (elapsed < 1000) {
+      petX -= 3;
+    } else if (elapsed < 1500) {
+      petX += 3;
+    } else if (elapsed < 2000) {
+      petX -= 3;
+    } else {
+      currentMode = MODE_NORMAL;
+    }
+    petX = constrain(petX, 2, SCREEN_WIDTH - PET_SPRITE_WIDTH - 2);
+  } else if (currentMode == MODE_JUMPING) {
+    if (elapsed < 150) petY = 22;
+    else if (elapsed < 300) petY = 28;
+    else if (elapsed < 450) petY = 20;
+    else {
+      petY = 28;
+      currentMode = MODE_NORMAL;
+    }
+  } else if (currentMode == MODE_HEARTS) {
+    if (elapsed > 2000) currentMode = MODE_NORMAL;
+  }
+
+  // Idle wandering
+  if (currentMode == MODE_NORMAL && !isMenuOpen && !showStats) {
+    if (now - lastWalkTime > 350) {
+      lastWalkTime = now;
+      petX += petDirX * 2;
+      if (petX <= 2 || petX >= SCREEN_WIDTH - PET_SPRITE_WIDTH - 2) {
+        petDirX *= -1;
+      }
+    }
+  }
+}
+
+// ============================================================================
+// UI RENDERING
+// ============================================================================
+
+void drawRadialMenu() {
+  int cx = SCREEN_WIDTH / 2;
+  int cy = SCREEN_HEIGHT / 2;
+
+  display.drawCircle(cx, cy, 22, SSD1306_WHITE);
+
+  const int offsets[4][2] = {
+    {cx - 10, cy - 26}, // Top
+    {cx + 12, cy - 4},  // Right
+    {cx - 10, cy + 18}, // Bottom
+    {cx - 32, cy - 4}   // Left
+  };
+
+  for (int i = 0; i < 4; i++) {
+    if (selectedSector == i) {
+      display.fillRect(offsets[i][0] - 2, offsets[i][1] - 1, 26, 9, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    } else {
+      display.drawRect(offsets[i][0] - 2, offsets[i][1] - 1, 26, 9, SSD1306_WHITE);
+      display.setTextColor(SSD1306_WHITE);
+    }
+    display.setCursor(offsets[i][0], offsets[i][1]);
+    display.print(MENU_ITEMS[i].label);
+  }
+
+  int bx = cx, by = cy;
+  if (selectedSector == 0) by -= 10;
+  else if (selectedSector == 1) bx += 10;
+  else if (selectedSector == 2) by += 10;
+  else if (selectedSector == 3) bx -= 10;
+
+  display.fillCircle(bx, by, 3, SSD1306_WHITE);
+}
+
+void drawStatsScreen() {
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(F("--- STARBIE STATS ---"));
+
+  display.setCursor(0, 14);
+  display.print(F("JOY: ")); display.print(joy); display.println(F("%"));
+
+  display.setCursor(0, 26);
+  display.print(F("ENERGY: ")); display.print(energy); display.println(F("%"));
+
+  display.setCursor(0, 38);
+  display.print(F("FULL: ")); display.print(fullness); display.println(F("%"));
+
+  if (USE_DHT11) {
+    float temp = dht.readTemperature();
+    float hum = dht.readHumidity();
+    display.setCursor(0, 50);
+    if (!isnan(temp) && !isnan(hum)) {
+      display.print((int)temp); display.print(F("C  "));
+      display.print((int)hum); display.print(F("%RH"));
+    } else {
+      display.print(F("DHT11 Reading..."));
+    }
+  }
+}
+
+// ============================================================================
+// MAIN ARDUINO SETUP & LOOP
+// ============================================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(BUTTON_ONE_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_TWO_PIN, INPUT_PULLUP);
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("OLED init failed"));
+    for (;;);
+  }
+  display.clearDisplay();
+  display.display();
+
+  if (!mpu.begin()) {
+    Serial.println(F("MPU6050 init failed"));
+  } else {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  }
+
+  if (USE_DHT11) {
+    dht.begin();
+  }
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // 1. Read Button Inputs
+  bool b1 = digitalRead(BUTTON_ONE_PIN);
+  bool b2 = digitalRead(BUTTON_TWO_PIN);
+
+  if (b1 == LOW && prevBtn1 == HIGH && (now - lastBtn1Press > 200)) {
+    lastBtn1Press = now;
+    if (!isMenuOpen) {
+      isMenuOpen = true;
+      showStats = false;
+    } else {
+      isMenuOpen = false;
+      applyMenuChoice(selectedSector);
+    }
+  }
+  prevBtn1 = b1;
+
+  if (b2 == LOW && prevBtn2 == HIGH && (now - lastBtn2Press > 200)) {
+    lastBtn2Press = now;
+    if (!isMenuOpen) {
+      showStats = !showStats;
+    }
+  }
+  prevBtn2 = b2;
+
+  // 2. Read MPU6050 Sensors
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  if (isMenuOpen) {
+    float ax = a.acceleration.x;
+    float ay = a.acceleration.y;
+
+    if (ay > 2.5)       selectedSector = 0; // Top
+    else if (ax > 2.5)  selectedSector = 1; // Right
+    else if (ay < -2.5) selectedSector = 2; // Bottom
+    else if (ax < -2.5) selectedSector = 3; // Left
+  } else {
+    float totalAccel = sqrt(a.acceleration.x * a.acceleration.x +
+                            a.acceleration.y * a.acceleration.y +
+                            a.acceleration.z * a.acceleration.z);
+    if (totalAccel > 17.0) {
+      if (currentMode == MODE_NAPPING) {
+        currentMode = MODE_NORMAL;
+      } else if (currentMode == MODE_NORMAL) {
+        modeStartTime = now;
+        currentMode = MODE_JUMPING;
+      }
+    }
+  }
+
+  // 3. Render Display
+  display.clearDisplay();
+
+  if (showStats) {
+    drawStatsScreen();
+  } else {
+    updateAnimations();
+    drawPet(petX, petY);
+
+    if (currentMode == MODE_NAPPING) {
+      for (int i = 0; i < 3; i++) {
+        if (zzzs[i].active) {
+          display.setCursor(zzzs[i].x, zzzs[i].y);
+          display.print(F("z"));
+          zzzs[i].y -= 1;
+          zzzs[i].x += (random(0, 2) == 0) ? 1 : -1;
+          if (zzzs[i].y < petY - 12) zzzs[i].active = false;
+        }
+      }
+    }
+
+    if (currentMode == MODE_HEARTS || currentMode == MODE_RUNNING) {
+      for (int i = 0; i < 5; i++) {
+        if (hearts[i].active) {
+          drawHeartIcon(hearts[i].x, hearts[i].y);
+          hearts[i].y -= 1;
+          if (hearts[i].y < 4) hearts[i].active = false;
+        }
+      }
+    }
+
+    if (isMenuOpen) {
+      drawRadialMenu();
+    }
+  }
+
+  display.display();
+  delay(20);
+}
